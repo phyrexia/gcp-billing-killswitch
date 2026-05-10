@@ -137,47 +137,64 @@ for MEMBER in "serviceAccount:$PUBSUB_SA" "serviceAccount:$SA_EMAIL"; do
     --role="roles/run.invoker" --quiet 2>/dev/null || true
 done
 
-# ── Cloud Monitoring spike alerts ────────────
-echo "==> Creating Pub/Sub notification channel for Cloud Monitoring"
-CHANNEL_NAME=$(
-  gcloud beta monitoring channels create \
-    --display-name="billing-killswitch-pubsub" \
-    --type=pubsub \
-    --channel-labels="topic=projects/$HOST_PROJECT/topics/$TOPIC" \
-    --project="$HOST_PROJECT" \
-    --format="value(name)" 2>/dev/null \
-  || gcloud beta monitoring channels list \
-    --filter="displayName=billing-killswitch-pubsub" \
-    --project="$HOST_PROJECT" \
-    --format="value(name)" | head -1
-)
-echo "    Channel: $CHANNEL_NAME"
-
-echo "==> Creating request spike alerting policies..."
-echo "    NOTE: Policies only cover projects in this monitoring scope."
-echo "    To monitor other projects: Monitoring > Settings > Add GCP projects"
+# ── Cloud Monitoring spike alerts (one policy per project) ───────────────────
+# Each project gets its own notification channel + alerting policy.
+# This avoids cross-project monitoring scope limitations entirely.
+echo "==> Creating spike alerting policies (one per project)..."
 for PROJECT in "${PROJECTS[@]}"; do
-  POLICY_NAME="killswitch-spike-$PROJECT"
-  echo "  -> $PROJECT (>${SPIKE_THRESHOLD} req/${SPIKE_WINDOW_SECONDS}s)"
+  echo "  -> $PROJECT"
+  PROJECT_NUMBER=$(gcloud projects describe "$PROJECT" --format="value(projectNumber)")
 
-  EXISTING=$(gcloud monitoring policies list \
-    --filter="displayName=$POLICY_NAME" \
+  # Get or create Pub/Sub notification channel in target project
+  CHANNEL=$(gcloud beta monitoring channels list \
+    --project="$PROJECT" \
+    --format="value(name)" \
+    --filter='displayName="billing-killswitch-pubsub"' 2>/dev/null | head -1)
+
+  if [ -z "$CHANNEL" ]; then
+    gcloud beta monitoring channels create \
+      --display-name="billing-killswitch-pubsub" \
+      --type=pubsub \
+      --channel-labels="topic=projects/$HOST_PROJECT/topics/$TOPIC" \
+      --project="$PROJECT" --quiet 2>/dev/null
+    CHANNEL=$(gcloud beta monitoring channels list \
+      --project="$PROJECT" \
+      --format="value(name)" \
+      --filter='displayName="billing-killswitch-pubsub"' 2>/dev/null | head -1)
+  fi
+  echo "     channel: $CHANNEL"
+
+  # Grant monitoring notification SA publish access to central Pub/Sub topic
+  MONITORING_SA="service-${PROJECT_NUMBER}@gcp-sa-monitoring-notification.iam.gserviceaccount.com"
+  gcloud pubsub topics add-iam-policy-binding "$TOPIC" \
     --project="$HOST_PROJECT" \
-    --format="value(name)" 2>/dev/null | head -1)
+    --member="serviceAccount:$MONITORING_SA" \
+    --role="roles/pubsub.publisher" \
+    --quiet 2>/dev/null || true
 
+  # Skip if policy already exists
+  EXISTING=$(gcloud monitoring policies list \
+    --project="$PROJECT" \
+    --format="value(name)" \
+    --filter='displayName="killswitch-spike-'"$PROJECT"'"' 2>/dev/null | head -1)
   if [ -n "$EXISTING" ]; then
-    echo "     Already exists, skipping."
+    echo "     policy: already exists"
+    continue
+  fi
+
+  if [ -z "$CHANNEL" ]; then
+    echo "     WARNING: could not create notification channel, skipping policy"
     continue
   fi
 
   POLICY_FILE=$(mktemp /tmp/policy-XXXXXX.json)
   cat > "$POLICY_FILE" <<EOF
 {
-  "displayName": "$POLICY_NAME",
+  "displayName": "killswitch-spike-$PROJECT",
   "conditions": [{
     "displayName": "API spike in $PROJECT",
     "conditionThreshold": {
-      "filter": "resource.type=\"consumed_api\" AND resource.labels.project_id=\"$PROJECT\" AND metric.type=\"serviceruntime.googleapis.com/api/request_count\"",
+      "filter": "resource.type=\"consumed_api\" AND metric.type=\"serviceruntime.googleapis.com/api/request_count\"",
       "aggregations": [{"alignmentPeriod": "${SPIKE_WINDOW_SECONDS}s", "perSeriesAligner": "ALIGN_RATE"}],
       "comparison": "COMPARISON_GT",
       "thresholdValue": $SPIKE_THRESHOLD,
@@ -185,15 +202,14 @@ for PROJECT in "${PROJECTS[@]}"; do
     }
   }],
   "alertStrategy": {"autoClose": "1800s"},
-  "notificationChannels": ["$CHANNEL_NAME"],
+  "notificationChannels": ["$CHANNEL"],
   "combiner": "OR"
 }
 EOF
   gcloud monitoring policies create \
     --policy-from-file="$POLICY_FILE" \
-    --project="$HOST_PROJECT" \
-    --format="value(name)" 2>&1 \
-  || echo "     WARNING: Policy creation failed (project may not be in monitoring scope)"
+    --project="$PROJECT" \
+    --format="value(name)" 2>&1 | sed 's/^/     policy: /'
   rm -f "$POLICY_FILE"
 done
 
@@ -229,7 +245,4 @@ echo "    Function:  https://console.cloud.google.com/functions/details/$REGION/
 echo "    Budgets:   https://console.cloud.google.com/billing/$BILLING_ACCOUNT/budgets"
 echo "    Alerts:    https://console.cloud.google.com/monitoring/alerting?project=$HOST_PROJECT"
 echo ""
-echo "    MULTI-PROJECT SPIKE DETECTION:"
-echo "    To enable spike alerts for projects outside HOST_PROJECT, add them"
-echo "    to the monitoring metrics scope:"
-echo "    https://console.cloud.google.com/monitoring/settings?project=$HOST_PROJECT"
+echo "    Spike alerts deployed independently in each protected project."
