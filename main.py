@@ -1,15 +1,21 @@
 import base64
 import json
+import os
 from googleapiclient import discovery
+from googleapiclient.errors import HttpError
+
+# Set SIMULATE_DEACTIVATION=true to test the full pipeline without actually
+# disabling billing. Logs "[SIMULATE]" instead of making API changes.
+SIMULATE = os.getenv("SIMULATE_DEACTIVATION", "false").lower() == "true"
 
 
 def kill_billing(event, context):
     """
     Cloud Function triggered by Pub/Sub.
-    Handles two sources:
-      1. Billing budget alerts  — fires when monthly cost >= budget (~24h latency)
-      2. Cloud Monitoring alerts — fires on request spike (~5 min latency)
-    Either one disables billing on the affected project immediately.
+    Handles two alert sources:
+      1. Cloud Monitoring incident (request spike) — ~5 min latency
+      2. Billing budget alert (monthly cost threshold) — ~24h latency
+    Either source triggers an immediate billing disable on the affected project.
     """
     attributes = event.get('attributes', {})
     pubsub_message = base64.b64decode(event['data']).decode('utf-8')
@@ -26,7 +32,7 @@ def kill_billing(event, context):
         state = incident.get('state', '')
 
         if state != 'open':
-            print(f"Monitoring alert resolved/closed for {project_id}. No action.")
+            print(f"Monitoring alert closed/resolved for {project_id}. No action.")
             return
 
         if not project_id:
@@ -34,7 +40,6 @@ def kill_billing(event, context):
             return
 
         print(f"MONITORING SPIKE: project={project_id} condition={condition}")
-        print(f"KILLSWITCH TRIGGERED (spike): disabling billing for {project_id}")
         _disable_billing(project_id)
         return
 
@@ -46,13 +51,13 @@ def kill_billing(event, context):
     currency = pubsub_data.get('currencyCode', 'USD')
 
     if not project_id:
-        print(f"WARNING: No project_id in message. Budget: {budget_name}")
+        print(f"WARNING: No project_id in message attributes. Budget: {budget_name}")
         return
 
-    print(f"Budget alert: project={project_id} cost={cost} {currency} budget={budget} {currency}")
+    print(f"Budget alert: project={project_id} cost={cost} {currency} / {budget} {currency} ({budget_name})")
 
     if cost >= budget:
-        print(f"KILLSWITCH TRIGGERED (budget): {project_id} — {cost} >= {budget} {currency}")
+        print(f"KILLSWITCH: {project_id} — {cost} >= {budget} {currency}")
         _disable_billing(project_id)
     else:
         print(f"OK: {project_id} — {cost} < {budget} {currency}. No action.")
@@ -60,9 +65,38 @@ def kill_billing(event, context):
 
 def _disable_billing(project_id):
     billing = discovery.build('cloudbilling', 'v1', cache_discovery=False)
-    request = billing.projects().updateBillingInfo(
-        name=f'projects/{project_id}',
-        body={'billingAccountName': ''}
-    )
-    response = request.execute()
-    print(f"Billing disabled for {project_id}: {response}")
+
+    # Check if billing is already disabled to avoid redundant API calls
+    try:
+        info = billing.projects().getBillingInfo(name=f'projects/{project_id}').execute()
+        if not info.get('billingEnabled', False):
+            print(f"Billing already disabled for {project_id}. Nothing to do.")
+            return
+    except HttpError as e:
+        if e.resp.status == 403:
+            print(
+                f"ERROR: Permission denied reading billing info for {project_id}. "
+                f"Ensure the function SA has roles/billing.projectManager on this project."
+            )
+            return
+        raise
+
+    if SIMULATE:
+        print(f"[SIMULATE] Would have disabled billing for {project_id}. "
+              f"Set SIMULATE_DEACTIVATION=false (or unset it) to arm the killswitch.")
+        return
+
+    try:
+        response = billing.projects().updateBillingInfo(
+            name=f'projects/{project_id}',
+            body={'billingAccountName': ''}
+        ).execute()
+        print(f"Billing disabled for {project_id}: {response}")
+    except HttpError as e:
+        if e.resp.status == 403:
+            print(
+                f"ERROR: Permission denied disabling billing for {project_id}. "
+                f"Ensure the function SA has roles/billing.projectManager on this project."
+            )
+        else:
+            raise

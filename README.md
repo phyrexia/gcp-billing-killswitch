@@ -39,10 +39,7 @@ Either layer independently triggers the same Cloud Function, which immediately u
 
 ## Prerequisites
 
-- `gcloud` CLI authenticated with an account that has:
-  - `Project Owner` or `Editor` on the host project
-  - `Billing Account Administrator` on the billing account (needed to grant the function's SA)
-- `gh` CLI (only needed to create the repo, not for deployment)
+- `gcloud` CLI authenticated with an account that has `Project Owner` or `Editor` on the host project and all protected projects
 - Python 3.11+
 
 ## Setup
@@ -79,39 +76,31 @@ This will:
 4. Create a Cloud Monitoring alerting policy per project (Layer 1)
 5. Create a $100/month budget per project (Layer 2)
 
-### 3. Grant IAM (manual step — required)
+### 3. Done
 
-The script will print the function's service account. You must grant it **Billing Account Administrator** on your billing account — this cannot be done via `gcloud` CLI without org-level permissions.
-
-Go to: `https://console.cloud.google.com/billing/YOUR_BILLING_ACCOUNT_ID/manage`  
-→ **Add member** → paste the service account → **Billing Account Administrator**
-
-Without this, the function will run but fail to disable billing.
+`deploy.sh` creates a dedicated service account (`kill-billing-sa`) and automatically grants it `roles/billing.projectManager` on each protected project — no manual IAM steps required.
 
 ## Testing with simulation mode
 
-Before going live, verify the full pipeline without risk:
+Deploy in dry-run mode first — the function runs the full pipeline but logs `[SIMULATE]` instead of making billing changes:
 
 ```bash
-# Redeploy with simulation mode enabled
-gcloud functions deploy kill-billing \
-  --set-env-vars SIMULATE_DEACTIVATION=true \
-  --region=us-central1 \
-  --project=YOUR_HOST_PROJECT
+# Deploy in simulation mode
+bash deploy.sh --simulate
 
-# Manually publish a fake billing alert to the topic
+# Publish a fake billing alert
 gcloud pubsub topics publish billing-alerts \
   --project=YOUR_HOST_PROJECT \
   --message='{"costAmount":150,"budgetAmount":100,"budgetDisplayName":"test","currencyCode":"USD"}' \
   --attribute="billing.googleapis.com/ProjectId=YOUR_PROJECT_ID"
 
-# Check the function logs
+# Check logs
 gcloud functions logs read kill-billing --region=us-central1 --limit=20
 ```
 
-You should see `[SIMULATE]` in the logs instead of actual billing changes.
+You should see `[SIMULATE] Would have disabled billing for ...` in the logs.
 
-When ready for production, redeploy without the env var (or set it to `false`).
+When ready to arm: `bash deploy.sh` (without `--simulate`).
 
 ## Tuning the spike threshold
 
