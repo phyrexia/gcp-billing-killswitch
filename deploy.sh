@@ -69,6 +69,12 @@ gcloud projects add-iam-policy-binding "$HOST_PROJECT" \
   --condition=None \
   --quiet
 
+echo "==> Granting roles/billing.admin to SA on billing account"
+gcloud beta billing accounts add-iam-policy-binding "$BILLING_ACCOUNT" \
+  --member="serviceAccount:$SA_EMAIL" \
+  --role="roles/billing.admin" \
+  --quiet
+
 echo "==> Granting roles/billing.projectManager to SA on each protected project"
 for PROJECT in "${PROJECTS[@]}"; do
   echo "  -> $PROJECT"

@@ -2,7 +2,7 @@ import base64
 import json
 import os
 from googleapiclient import discovery
-from googleapiclient.errors import HttpError
+from googleapiclient.errors import HttpError  # noqa: F401 used in _disable_billing
 
 # Set SIMULATE_DEACTIVATION=true to test the full pipeline without actually
 # disabling billing. Logs "[SIMULATE]" instead of making API changes.
@@ -64,39 +64,28 @@ def kill_billing(event, context):
 
 
 def _disable_billing(project_id):
-    billing = discovery.build('cloudbilling', 'v1', cache_discovery=False)
-
-    # Check if billing is already disabled to avoid redundant API calls
-    try:
-        info = billing.projects().getBillingInfo(name=f'projects/{project_id}').execute()
-        if not info.get('billingEnabled', False):
-            print(f"Billing already disabled for {project_id}. Nothing to do.")
-            return
-    except HttpError as e:
-        if e.resp.status == 403:
-            print(
-                f"ERROR: Permission denied reading billing info for {project_id}. "
-                f"Ensure the function SA has roles/billing.projectManager on this project."
-            )
-            return
-        raise
-
     if SIMULATE:
         print(f"[SIMULATE] Would have disabled billing for {project_id}. "
               f"Set SIMULATE_DEACTIVATION=false (or unset it) to arm the killswitch.")
         return
 
+    billing = discovery.build('cloudbilling', 'v1', cache_discovery=False)
     try:
+        # updateBillingInfo with empty billingAccountName unlinks the project.
+        # Idempotent: if billing is already disabled it returns the current state.
         response = billing.projects().updateBillingInfo(
             name=f'projects/{project_id}',
             body={'billingAccountName': ''}
         ).execute()
-        print(f"Billing disabled for {project_id}: {response}")
+        if response.get('billingEnabled', False):
+            print(f"WARNING: billing still enabled for {project_id} after update: {response}")
+        else:
+            print(f"Billing disabled for {project_id}.")
     except HttpError as e:
         if e.resp.status == 403:
             print(
                 f"ERROR: Permission denied disabling billing for {project_id}. "
-                f"Ensure the function SA has roles/billing.projectManager on this project."
+                f"Ensure the function SA has roles/billing.admin on the billing account."
             )
         else:
             raise
