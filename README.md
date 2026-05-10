@@ -1,21 +1,25 @@
 # GCP Billing Killswitch
 
-Automatically disables billing on Google Cloud projects the moment costs go out of control — two layers of protection with very different latencies.
+> "I woke up to a $47,000 Google Cloud bill. My API key had been scraped from a public repo."
 
-## The problem
+This happens every week. A leaked key, a misconfigured job, a runaway service — and by the time GCP's native billing alerts fire, the damage is already done. Standard budget alerts have **up to 24 hours of data latency**. In that window, a compromised Vertex AI or Maps API key can generate tens of thousands of dollars in charges.
 
-A compromised API key, a misconfigured job, or a runaway service can rack up thousands of dollars in hours. GCP's native billing alerts have **up to 24 hours of latency** — by the time the alert fires, the damage is done.
+This tool cuts billing the moment an attack is detected — not the next day.
 
-## Solution: two-layer killswitch
+---
+
+## How it works
+
+Two independent layers with very different response times:
 
 ```
 Anomaly detected
       │
-      ├─── Layer 1: Cloud Monitoring (request spike)
+      ├─── Layer 1: Request spike (Cloud Monitoring)
       │    Latency: ~5 minutes
-      │    Trigger: API request count exceeds threshold in a 5-min window
+      │    Trigger: API call volume exceeds threshold in a 5-min window
       │
-      └─── Layer 2: Budget alert (cost threshold)
+      └─── Layer 2: Budget threshold (Billing Alert)
            Latency: ~24 hours
            Trigger: monthly spend reaches $100 (configurable)
                                    │
@@ -26,35 +30,48 @@ Anomaly detected
                     → billing unlinked → services shut down
 ```
 
-Either layer independently triggers the same Cloud Function, which immediately unlinks billing from the affected project.
+Either layer independently triggers the same Cloud Function, which immediately unlinks billing from the affected project. One deployment protects all your projects.
 
-> **Note**: When billing is disabled, GCP begins shutting down services within minutes to hours. Free-tier resources continue running; billable ones do not.
+> **What happens when it fires:** GCP begins shutting down billable services within minutes to hours. Free-tier resources stay up. To re-enable: go to `Billing > My projects` and re-link.
+
+---
 
 ## Features
 
-- **Dual-trigger architecture** — spike detection (~5 min) + budget backstop (~24h)
-- **Multi-project** — one deployment protects all your projects; project ID is read dynamically from each alert
-- **Simulation mode** — test the full pipeline without actually disabling billing (`SIMULATE_DEACTIVATION=true`)
-- **Single command deploy** — one `bash deploy.sh` sets up Pub/Sub, Cloud Function, monitoring policies, and budgets
+- **Dual-trigger** — spike detection (~5 min) + budget backstop (~24h)
+- **Multi-project** — one function, all projects; each alerts independently
+- **Simulation mode** — test the full pipeline without touching billing (`bash deploy.sh --simulate`)
+- **Dedicated SA** — minimal-permission service account, no manual IAM steps
+- **Single command** — one `bash deploy.sh` sets up everything end-to-end
+
+---
 
 ## Prerequisites
 
-- `gcloud` CLI authenticated with an account that has `Project Owner` or `Editor` on the host project and all protected projects
+- `gcloud` CLI authenticated as `Project Owner` or `Editor` on all protected projects
 - Python 3.11+
+
+---
 
 ## Setup
 
-### 1. Configure `deploy.sh`
+### 1. Clone and configure
+
+```bash
+git clone https://github.com/phyrexia/gcp-billing-killswitch
+cd gcp-billing-killswitch
+```
 
 Edit the variables at the top of `deploy.sh`:
 
 ```bash
-HOST_PROJECT="your-host-project-id"        # Project where the function lives
-BILLING_ACCOUNT="XXXXXX-XXXXXX-XXXXXX"     # Your billing account ID
-SPIKE_THRESHOLD=500                         # Requests per 5-min window before killswitch fires
-PROJECTS=(                                  # All projects to protect
-  "project-id-1"
-  "project-id-2"
+HOST_PROJECT="your-host-project-id"       # Project where the function lives
+BILLING_ACCOUNT="XXXXXX-XXXXXX-XXXXXX"   # gcloud beta billing accounts list
+BUDGET_AMOUNT="100USD"                    # Per-project monthly hard cap
+
+PROJECTS=(                                # All projects to protect
+  "your-project-1"
+  "your-project-2"
 )
 ```
 
@@ -63,32 +80,22 @@ Find your billing account ID:
 gcloud beta billing accounts list
 ```
 
-### 2. Deploy
-
+Find projects linked to that billing account:
 ```bash
-bash deploy.sh
+gcloud beta billing projects list --billing-account=YOUR_BILLING_ACCOUNT_ID
 ```
 
-This will:
-1. Enable required APIs
-2. Create a Pub/Sub topic (`billing-alerts`)
-3. Deploy the Cloud Function
-4. Create a Cloud Monitoring alerting policy per project (Layer 1)
-5. Create a $100/month budget per project (Layer 2)
+### 2. Test first (recommended)
 
-### 3. Done
-
-`deploy.sh` creates a dedicated service account (`kill-billing-sa`) and automatically grants it `roles/billing.projectManager` on each protected project — no manual IAM steps required.
-
-## Testing with simulation mode
-
-Deploy in dry-run mode first — the function runs the full pipeline but logs `[SIMULATE]` instead of making billing changes:
+Deploy in dry-run mode — the function runs but logs `[SIMULATE]` instead of touching billing:
 
 ```bash
-# Deploy in simulation mode
 bash deploy.sh --simulate
+```
 
-# Publish a fake billing alert
+Trigger a fake alert to verify the pipeline end-to-end:
+
+```bash
 gcloud pubsub topics publish billing-alerts \
   --project=YOUR_HOST_PROJECT \
   --message='{"costAmount":150,"budgetAmount":100,"budgetDisplayName":"test","currencyCode":"USD"}' \
@@ -98,58 +105,70 @@ gcloud pubsub topics publish billing-alerts \
 gcloud functions logs read kill-billing --region=us-central1 --limit=20
 ```
 
-You should see `[SIMULATE] Would have disabled billing for ...` in the logs.
+You should see `[SIMULATE] Would have disabled billing for ...`
 
-When ready to arm: `bash deploy.sh` (without `--simulate`).
+### 3. Arm it
+
+```bash
+bash deploy.sh
+```
+
+This sets up (idempotent — safe to re-run):
+1. Required APIs enabled
+2. Dedicated service account with minimal permissions
+3. Pub/Sub topic `billing-alerts`
+4. Cloud Function deployed (Gen2, Python 3.11)
+5. Cloud Monitoring spike alert per project (~5 min layer)
+6. Budget alert per project — $100/month cap (~24h layer)
+
+---
 
 ## Tuning the spike threshold
 
-The default threshold of **500 requests in 5 minutes** suits low-traffic projects. For projects with regular high-volume API usage, raise it to avoid false positives:
+The default of **500 requests in 5 minutes** suits idle or low-traffic projects. For projects with sustained API usage, raise it to avoid false positives:
 
 ```bash
-# In deploy.sh, per-project override example:
-SPIKE_THRESHOLD_agentbox=5000
-SPIKE_THRESHOLD_default=500
+SPIKE_THRESHOLD=5000   # adjust in deploy.sh
 ```
 
-Or adjust `SPIKE_THRESHOLD` globally in `deploy.sh`.
+You can also set different thresholds per project by editing the alerting policy JSON in the deploy loop.
 
-## What happens when it fires
-
-1. Cloud Function calls `cloudbilling.projects.updateBillingInfo` with an empty `billingAccountName`
-2. GCP unlinks the project from the billing account
-3. Billable services begin shutting down (Compute Engine VMs, Cloud SQL, etc.)
-4. Free-tier services and static resources remain intact
-5. To re-enable: go to `Billing > My projects` in GCP Console and re-link the billing account
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         GCP Projects                            │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
-│  │ project1 │  │ project2 │  │ project3 │  │ projectN │       │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘       │
-│       │              │              │              │             │
-│  Budget &       Budget &       Budget &       Budget &           │
-│  Monitoring     Monitoring     Monitoring     Monitoring         │
-│       │              │              │              │             │
-└───────┼──────────────┼──────────────┼──────────────┼────────────┘
-        │              │              │              │
-        └──────────────┴──────┬───────┴──────────────┘
-                               │
-                    Pub/Sub topic: billing-alerts
-                    (hosted in HOST_PROJECT)
-                               │
-                    ┌──────────▼──────────┐
-                    │   Cloud Function     │
-                    │   kill-billing       │
-                    │                      │
-                    │  reads project_id    │
-                    │  from message        │
-                    │  disables billing    │
-                    └─────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Protected Projects                                          │
+│                                                              │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐        │
+│  │  project-1  │   │  project-2  │   │  project-N  │        │
+│  │             │   │             │   │             │        │
+│  │ Budget +    │   │ Budget +    │   │ Budget +    │        │
+│  │ Monitoring  │   │ Monitoring  │   │ Monitoring  │        │
+│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘        │
+└─────────┼────────────────┼────────────────┼──────────────────┘
+          │                │                │
+          └────────────────┴────────────────┘
+                           │
+               Pub/Sub topic: billing-alerts
+               (hosted in HOST_PROJECT)
+                           │
+               ┌───────────▼───────────┐
+               │    Cloud Function     │
+               │    kill-billing       │
+               │                      │
+               │  reads project_id    │
+               │  from alert message  │
+               │  calls Billing API   │
+               └───────────────────────┘
+                           │
+               billingAccountName = ""
+               → project unlinked from billing
+               → billable services shut down
 ```
+
+---
 
 ## Files
 
@@ -157,18 +176,24 @@ Or adjust `SPIKE_THRESHOLD` globally in `deploy.sh`.
 |------|-------------|
 | `main.py` | Cloud Function — handles both budget and monitoring alerts |
 | `requirements.txt` | Python dependencies |
-| `deploy.sh` | Full automated setup script |
+| `deploy.sh` | Full automated setup — idempotent, safe to re-run |
 
-## Comparison with similar projects
+---
+
+## Comparison
 
 | Feature | This project | derailed-dash | dataslayermedia |
-|---------|-------------|---------------|-----------------|
+|---------|:-----------:|:-------------:|:---------------:|
 | Spike detection (~5 min) | ✅ | ❌ | ❌ |
 | Budget backstop (~24h) | ✅ | ✅ | ✅ |
-| Multi-project support | ✅ | ✅ | ❌ |
+| Multi-project | ✅ | ✅ | ❌ (hardcoded) |
 | Simulation / dry-run | ✅ | ✅ | ❌ |
+| Dedicated SA (least privilege) | ✅ | ✅ | ❌ |
 | Single-command deploy | ✅ | Partial | ❌ |
+| Per-project independent alerts | ✅ | ❌ | ❌ |
+
+---
 
 ## License
 
-MIT
+MIT — use it, fork it, improve it.
